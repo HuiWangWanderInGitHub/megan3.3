@@ -1,6 +1,7 @@
 module voc_mod
    
    use netcdf
+   use, intrinsic :: ieee_arithmetic
 
    implicit none
    !private
@@ -20,7 +21,6 @@ module voc_mod
    real,            allocatable :: mech_mwt(:)
    character( 16 ), allocatable :: mech_spc(:)
 
-   INCLUDE 'tables/LSM.EXT'
    INCLUDE 'tables/MEGAN.EXT'
 
 contains
@@ -30,9 +30,8 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
              temp,rad,wind,pres,qv,                        & !air temperature [ºK], Photosynt. Phton Flx Dnsty [W m-2], Wind spd. [m/s], Press [Pa], Humdty [m3/m3]
              laip, laic,                                   &
              ctf, efmaps, ldf_in,                          & !lai,emis factors, light emis factors
-             lsm,soil_type,soil_moisture,                  & !land surface model, soil type, soil_moisture
              tmp_max, tmp_min, wind_max, tmp_avg, ppfd_avg, & !meteo daily
-             non_dimgarma) !emis                           ) !out: Emision values
+             non_dimgarma,flower_flag,litter_flag) !emis                           ) !out: Emision values
 
     implicit none
     ! input variables
@@ -45,9 +44,7 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
     real,    intent(in)     :: efmaps(ncols,nrows,19) !only 19
     real,    intent(in)     :: ldf_in(ncols,nrows,4 ) !only 4 use maps
 
-    character(len=4),intent(in)   :: LSM          !land surface model 
-    integer, intent(in)     ::  soil_type(ncols,nrows)
-    real,    intent(in)     ::  soil_moisture(ncols,nrows)
+    logical, intent(in)     :: flower_flag,litter_flag
 
     ! output variables 
     !real   ,intent(inout) :: emis(ncols,nrows,n_spca_spc)
@@ -77,17 +74,12 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
     real,dimension(layers) :: sunt,shat,sunf,sunp,shap
     !@@real,dimension(ncols,nrows,layers) :: sunt,shat,sunp,shap,sunf
 
-    !megsea local variables:
-    real,allocatable :: wwlt(:)
-
     logical, parameter :: gambd_yn  = .false. !.true. !
     logical, parameter :: gamaq_yn  = .false. !.true. !
     logical, parameter :: gamht_yn  = .false. !.true. !
     logical, parameter :: gamlt_yn  = .false. !.true. !
     logical, parameter :: gamhw_yn  = .false. !.true. !
     logical, parameter :: gamco2_yn = .false. !.true. !
-    logical, parameter :: gamsm_yn  = .false. !.true. ! for the cmaq implementation of megan  we refer to soil moisture at layer 2, 
-                                                      !which is 1 meter for px and 0.5 m for noah. Keep this in mind when enabling the GAMSM stress.
 
     !megvea local variables
     real  :: ER          ! Emission rate
@@ -99,19 +91,18 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
     real  :: gamht       ! EA response to high temperature
     real  :: gamlt       ! EA response to low temperature
     real  :: gamhw       ! EA response to high wind speed
-    real  :: gamsm       ! EA response to soil moisture
     real  :: gamco2      ! EA response to CO2
     real  :: gamtp       ! combines GAMLD, GAMLI, GAMP to get canopy average
     real  :: ldfmap      ! light depenedent fraction map
+    !account for flower and litter emission as the relative emission factor
+    real  :: gam_nonleaf       ! account for non-leaf emissions 
+    real, parameter :: gamflower  = 0.02!2% of the leaf level
+    real, parameter :: gamlitter  = 0.03!3% of the leaf level
 
-    REAL :: VPGWT(LAYERS)
-    REAL :: SUM1,SUM2,Ea1L,Ea2L
-    !@!!debug variables:
-    !@!integer :: ierr,var_id,ncid,col_dim_id,row_dim_id,lvl_dim_id
-    !@!  diagnostic variables:
-    !@!real ::  wilt_map(ncols,nrows)
-    !@!real :: gamsm_map(ncols,nrows)       ! EA response to soil moisture
-    !@!real ::    ER_map(ncols,nrows)       !emission rate
+    real :: VPGWT(LAYERS)
+    real :: SUM1,SUM2,Ea1L,Ea2L
+    real :: laiv
+
  
     print*,"   > Exec. megan_voc"
 
@@ -128,40 +119,44 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
         end do
     ENDIF
 
-    select case (trim(LSM)) !get Land Surface Model - Parameters
-           case ('NOAH' )
-              allocate(wwlt(size(wwlt_noah))); wwlt=wwlt_noah;
-           case ('JN90' )
-              !allocate(wwlt(size(wwlt_jn90))); wwlt=wwlt_jn90;
-              allocate(wwlt(size(WWLT_PX_WRFV4P))); wwlt=WWLT_PX_WRFV4P;
-           case DEFAULT
-              allocate(wwlt(size(WWLT_PX_WRFV3))); wwlt=WWLT_PX_WRFV3;
-    end select
-
    do j = 1, NROWS
       do i = 1, NCOLS! preserve stride 1 for output arrays
 
         !from megcan -----------
-        !print*,"MEGCAN.."
         sunt(:) = temp(i,j) !default values
         shat(:) = temp(i,j)                
         sunp(:) = rad(i,j )                 
         shap(:) = rad(i,j )                 
-        sunf(:) = 1.0                      
-        TotalCT=sum(ctf(i,j,:)) !*0.01                         !if sum of canopy fractions == 0 => no (canopy) vegetation.
+        sunf(:) = 1.0
+                  
+        non_dimgarma(i,j,:) = 0.0        
+        laiv = 0.0 
+        TotalCT=sum(ctf(i,j,:))  !if sum of canopy fractions == 0 => no (canopy) vegetation.
+        if (TotalCT <= 0.0 .or. LAIc(i,j) <= 0.0) then
+              cycle
+        endif
+
+        if (any(ctf(i,j,:) < 0.0)) then
+             error stop "Negative canopy fraction"
+        endif
+
         if (totalCT .gt. 0.0 .AND. LAIc(i,j) .gt. 0.0 ) then   !if some vegetation
 
-           ! Convert to "solar hour": 
+           ! Convert to "solar hour":
+
+           day   = real(ddd) 
            Hour  = real(HH) + long(i,j) / 15.0
            if ( hour  .lt. 0.0 ) then
-             hour  = hour + 24.0; day  = real(ddd)  - 1
-           elseif ( hour  .gt. 24.0 ) then
-             hour  = hour - 24.0; day  = real(ddd)  + 1
+             hour  = hour + 24.0
+             day   = day  - 1.0
+           elseif ( hour  .ge. 24.0 ) then
+             hour  = hour - 24.0
+             day   = day  + 1
            endif
 
            TairK0   = temp(i,j)      !air temperature   [K]                    (from meteo)
            Ws0      = wind(i,j)      !wind velocity     [m/s]                  (from meteo)
-           Solar    = rad(i,j)!/2.25 !phton dnsity flux [umol photons m-2 s-1] (from meteo)
+           Solar    = rad(i,j)/2.25  !solar radiation   [W m-2]                (from meteo)
 
            !(1) calc solar angle
            zenith      = CalcZenith(day,lat(i,j),hour)
@@ -191,7 +186,14 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
 
                 !(4) canopy radiation dist (ppdf)
                 !
-                call CanopyRad(VPgausDis, layers, LAIc(i,j), SinZenith,       & !in
+                laiv = LAIc(i,j)/(TotalCT*0.01)
+                !make sure the laiv is not geater than 7.
+                if (laiv .gt. 8.) then
+                        laiv=8.
+                end if
+
+                !call CanopyRad(VPgausDis, layers, LAIc(i,j), SinZenith,       & !in
+                call CanopyRad(VPgausDis, layers, laiv, SinZenith,       & !in
                       Qbeamv, Qdiffv, Qbeamn, Qdiffn, k, Canopychar, sun_frac,& !in
                       QbAbsV, QdAbsV, QsAbsV, QbAbsn, QdAbsn, QsAbsn, SunQv,  & !in
                       ShadeQv, SunQn, ShadeQn, sun_ppfd, shade_ppfd,          & !out
@@ -231,15 +233,9 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
         endif
 
         !-----------------------
-        !from megsea -----------
-        !EA response to Soil Moisture
-        IF ( gamsm_yn )  THEN; gamsm=gamma_sm(soil_type(i,j),soil_moisture(i,j),wwlt(soil_type(i,j)) ); ELSE;  gamsm = 1.0; ENDIF 
-        !wilt_map(i,j)=wwlt(soil_type(i,j)) !debug
-        !gamsm_map(i,j)=gamsm               !debug
-
-        !from megvea -----------
         ! Emission response to canopy depth
-        cdea(:)=gamma_cd(layers,laic(i,j))  
+        !cdea(:)=gamma_cd(layers,laic(i,j))  
+        cdea(:)=gamma_cd(layers,laiv,VPgausDis)  
         ! EA bidirectional exchange LAI response
         if ( gambd_yn )  then; gambd=gamma_laibidir(laic(i,j)); else;  gambd = 1.0; endif
         ! EA response to co2
@@ -251,7 +247,7 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
             IF ( S .EQ. 3 .OR. S .EQ. 4 .OR. S .EQ. 5 .OR. S .EQ. 6 ) THEN
                 LDFMAP = LDF_IN(i,j,S-2) ! only LDF 3, 4, 5, and 6 in file
             ELSE
-                LDFMAP = LDF(S) !For these species,  Read LDF from previous MEGVEA.EXT 
+               LDFMAP = LDF(S) !For these species,  Read LDF from previous MEGVEA.EXT 
             ENDIF
 
             ! EA response to leaf age 
@@ -280,7 +276,7 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
             GAMTP = SUM1*LDFMAP + SUM2*( 1.0-LDFMAP )
 
             ! ... Calculate emission activity factors
-            ER = LAIc(i,j) * GAMTP * GAMLA * GAMHW * GAMAQ * GAMHT * GAMLT * GAMSM
+            ER = LAIc(i,j) * GAMTP * GAMLA * GAMHW * GAMAQ * GAMHT * GAMLT
             !er_map(i,j) = ER  !debug
 
             IF ( S .EQ. 1 ) THEN
@@ -289,12 +285,35 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
                 ER = ER * GAMBD  ! GAMBD only applied to ethanol and acetaldehyde
             END IF
 
+            !if (.not. ieee_is_finite(ER)) then
+            !    print *,'x-y-s',i,j,s,' is_infinity'
+            !    print *,'SUM1',SUM1
+            !    print *,'SUM2',SUM1
+            !    print *,'LDFMAP',LDFMAP
+       
+            !    print *,'GAMLA',GAMLA
+            !end if
+
+            gam_nonleaf = 1.
+            ! add flower emission
+            if (flower_flag) then
+                gam_nonleaf = gam_nonleaf+gamflower
+            end if
+            ! add litter emission
+            if (litter_flag) then
+                gam_nonleaf = gam_nonleaf+gamlitter
+            end if
+            er = er * gam_nonleaf
+
+
+
             !IF ( ER(I,J) .GT. 0.0 ) THEN
             IF ( ER .GT. 0.0 ) THEN
                 non_dimgarma(i,j,s) = ER
             ELSE                  
                 non_dimgarma(i,j,s) = 0.0
             END IF
+
         end do  ! End loop of species (S)
 
      end do ! NCOLS
@@ -314,9 +333,6 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
 !@           !ierr=nf90_def_var(ncid,'SHAP'  ,NF90_FLOAT,[col_dim_id,row_dim_id,lvl_dim_id], var_id)
 !@           !ierr=nf90_def_var(ncid,'SUNF'  ,NF90_FLOAT,[col_dim_id,row_dim_id,lvl_dim_id], var_id)
 !@           !ierr=nf90_def_var(ncid,'ISLTY' ,NF90_FLOAT,[col_dim_id,row_dim_id], var_id)
-!@           ierr=nf90_def_var(ncid,'GAMSM' ,NF90_FLOAT,[col_dim_id,row_dim_id], var_id)
-!@           ierr=nf90_def_var(ncid,'WILT'  ,NF90_FLOAT,[col_dim_id,row_dim_id], var_id)
-!@           !ierr=nf90_def_var(ncid,'SOILM' ,NF90_FLOAT,[col_dim_id,row_dim_id], var_id)
 !@           !ierr=nf90_def_var(ncid,'LAI'   ,NF90_FLOAT,[col_dim_id,row_dim_id], var_id)
 !@        ierr=nf90_enddef(ncid)
 !@        ierr=nf90_open("debug.nc", NF90_WRITE, ncid )
@@ -325,11 +341,7 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
 !@           !ierr=nf90_inq_varid(ncid,'SUNP'   ,var_id  );ierr=nf90_put_var(ncid, var_id ,  SUNP   )
 !@           !ierr=nf90_inq_varid(ncid,'SHAP'   ,var_id  );ierr=nf90_put_var(ncid, var_id ,  SHAP   )
 !@           !ierr=nf90_inq_varid(ncid,'SUNF'   ,var_id  );ierr=nf90_put_var(ncid, var_id ,  SUNF   )
-!@           !ierr=nf90_inq_varid(ncid,'ISLTY'  ,var_id  );ierr=nf90_put_var(ncid, var_id , soil_type)
-!@           !ierr=nf90_inq_varid(ncid,'SOILM'  ,var_id  );ierr=nf90_put_var(ncid, var_id , soil_moisture)
 !@           !ierr=nf90_inq_varid(ncid,'LAI'    ,var_id  );ierr=nf90_put_var(ncid, var_id , laic     )
-!@           ierr=nf90_inq_varid(ncid,'GAMSM'  ,var_id  );ierr=nf90_put_var(ncid, var_id , gamsm_map)
-!@           ierr=nf90_inq_varid(ncid,'WILT'   ,var_id  );ierr=nf90_put_var(ncid, var_id ,  wilt_map)
 !@        ierr=nf90_close(ncid)
 !@!=====================================
 
@@ -337,17 +349,28 @@ subroutine megan_voc (yyyy,ddd,hh,                         & !year,julian day,ho
     
 contains
 
-    function gamma_cd(Layers,LAI)  result(cdea)
-      implicit none
-      integer, intent(in)     :: layers
-      real                    :: lai 
-      real, dimension(layers) :: cdea
-      integer :: k
-      do k=1,layers
-             cdea(k)=ccd1*min(lai*(k-0.5)/float(layers),3.0)+ccd2
-      enddo
-      return
-    end function
+    !function gamma_cd(Layers,LAI)  result(cdea)
+    !  implicit none
+    !  integer, intent(in)     :: layers
+    !  real                    :: lai 
+    !  real, dimension(layers) :: cdea
+    !  integer :: k
+    !  do k=1,layers
+    !         cdea(k)=ccd1*min(lai*(k-0.5)/float(layers),3.0)+ccd2
+    !  enddo
+    !  return
+    !end function
+    function gamma_cd(layers, lai, distgauss) result(cdea)
+        integer, intent(in) :: layers
+        real, intent(in) :: lai
+        real, intent(in) :: distgauss(layers)
+        real :: cdea(layers)
+        integer :: k
+    
+        do k = 1, layers
+            cdea(k) = ccd1 * min(lai*distgauss(k), 3.0) + ccd2
+        enddo
+    end function gamma_cd
     !----------------------------------------------------------------
     function gamma_laibidir(lai)  result(gambd)
       real, intent(in) :: lai
@@ -425,7 +448,8 @@ contains
             GAMP= 0.0
         ELSE
             Alpha  = 0.004
-            C1 = 0.0374 * EXP(0.0005 * (PPFD24 - 240)) * (PPFD24 ** 0.6)
+            !C1 = 0.0374 * EXP(0.0005 * (PPFD24 - 240)) * (PPFD24 ** 0.6)
+            C1 = 1.03
             GAMP= (Alpha * C1 * PPFD1) / SQRT(1.0 + Alpha**2 * PPFD1**2)
         ENDIF
     end function gamp
@@ -540,9 +564,9 @@ contains
         REAL       :: TSTLEN  
         !Time step of LAI data
         !if (USE_MEGAN_LAI) THEN
-        !  TSTLEN = 8.0 ! 8 daily from MEGAN file
+          TSTLEN = 8.0 ! 8 daily from MEGAN file
         !else
-          TSTLEN = 1.0 ! 1 Daily from soilout/metcro
+        !  TSTLEN = 1.0 ! 1 Daily from soilout/metcro
         !end if
 
         !---------------------------------------------------
@@ -585,25 +609,6 @@ contains
 
         RETURN
     end function gamma_age
-
-    !from MEGSEA ==========================================================
-    function gamma_sm(sltyp, soilm, wilt)
-        implicit none
-        real :: t1,soilm,wilt,gamma_sm
-        integer :: sltyp  
-
-         !wilt = wwlt(sltyp)
-         t1 = wilt + d1
-         if ( soilm < wilt ) then
-             gamma_sm = 0
-         else if ( soilm >= wilt .and. soilm < t1 ) then
-             gamma_sm = (soilm - wilt)/d1
-         else
-             gamma_sm = 1
-         end if
-    end function gamma_sm
-    !======================================================================
-
 
 !oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
 ! MEGCAN FUNCTIONS:                                             o
@@ -719,12 +724,12 @@ SUBROUTINE CanopyRad(Distgauss, Layers, LAI, SinZenith,           &
       INTEGER,INTENT(IN) :: Layers, NrCha, NrTyp, Cantype
       REAL,INTENT(IN) :: Qbeamv,Qdiffv,SinZenith,LAI,Qbeamn,Qdiffn
       REAL,DIMENSION(Layers),INTENT(IN) :: Distgauss
+      REAL,DIMENSION(NrCha,NrTyp),INTENT(IN) :: Canopychar
       ! output
       REAL,INTENT(OUT) :: QbAbsV, QbAbsn
       REAL,DIMENSION(Layers),INTENT(OUT) :: ShadePPFD, SunPPFD, &
                     QdAbsv, QsAbsv, QsAbsn, ShadeQv,  SunQn,  &
                     QdAbsn, SunQv, ShadeQn, Sunfrac 
-      REAL,DIMENSION(NrCha,NrTyp),INTENT(OUT) :: Canopychar
       ! internal variables
       INTEGER :: i
       REAL :: ScatV, ScatN, RefldV, RefldN, ReflbV, ReflbN,     & 
@@ -853,6 +858,8 @@ SUBROUTINE CanopyEB(Trate, Layers, Distgauss, Canopychar,            &
       REAL :: Cdepth, Lwidth, Llength, Cheight, Eps, TranspireType, Deltah, EmissAtm, IRin,IRout !LeafIR, 
 !     &         Deltah, UnexposedLeafIRin, ExposedLeafIRin, IRin,IRout
       REAL,DIMENSION(Layers) :: Ldepth, Wsh
+      real :: topWind, minimumWind, noWindDepth, attenuation
+      real :: EmissTop
 
       Cdepth        = Canopychar(1, Cantype)
       Lwidth        = Canopychar(2, Cantype)
@@ -872,12 +879,21 @@ SUBROUTINE CanopyEB(Trate, Layers, Distgauss, Canopychar,            &
       ENDIF
 
       Ldepth(:)     = Cdepth * Distgauss(:)
-      TairK(:)      = TairK0  + (Trate  * Ldepth(:))      ! check this
+      TairK(:)      = TairK0  - (Trate  * Ldepth(:))      ! check this
       HumidairPa(:) = HumidairPa0  + (Deltah * Ldepth(:))
 
       Wsh(:) = (Cheight-Ldepth(:)) - (Canopychar(16,Cantype) * Cheight)
-      Ws(:)  = (Ws0*LOG(Wsh(:))/LOG(Cheight-Canopychar(16,Cantype) * Cheight))
-      WHERE (Wsh(:) < 0.001) Ws(:) = 0.05
+      !Ws(:)  = (Ws0*LOG(Wsh(:))/LOG(Cheight-Canopychar(16,Cantype) * Cheight))
+      !WHERE (Wsh(:) < 0.001) Ws(:) = 0.05
+
+      
+      topWind     = max(Ws0, 0.001)
+      minimumWind = min(0.05, topWind)
+      noWindDepth = max(Canopychar(16,Cantype), 1.0e-6)
+      attenuation = -log(0.05) / noWindDepth
+      
+      Ws(:) = minimumWind + (topWind-minimumWind) * &
+        exp(-attenuation*Distgauss(:))
 
       DO i=1,Layers
 
@@ -891,11 +907,17 @@ SUBROUTINE CanopyEB(Trate, Layers, Distgauss, Canopychar,            &
          ! function of water vapor pressure (Pa) 
          ! and ambient Temperature (K) based on Brutsaert(1975) 
          ! referenced in Leuning (1997)
-         EmissAtm        = 0.642 * (HumidairPa(i) / TairK(i))**(1./7.)   
+         !EmissAtm        = 0.642 * (HumidairPa(i) / TairK(i))**(1./7.)  
+         !Idso equation (Idso 1981) 
+         EmissAtm        = 0.7 + 5.95 * (HumidairPa(i)/1000.0) * &
+                          1.0e-4 * exp(1500.0/TairK(i)) 
          IRin            = LeafIR (TairK(i), EmissAtm)
          ShadeleafIR(i)  = IRin
-         SunleafIR(i)    = IRin
-
+         !SunleafIR(i)    = IRin
+         !add the part to the top
+         EmissTop = 0.7 + 5.95 * (HumidairPa0/1000.0) * &
+                          1.0e-4 * exp(1500.0/TairK0)
+         SunleafIR(i)    = 0.75*IRin + 0.5*EmissTop*Sb*TairK0**4
       ! Sun
         CALL LeafEB(SunPPFD(i), SunQv(i) + SunQn(i),                    &
                    SunleafIR(i), Eps, TranspireType, Lwidth, Llength,   &
@@ -945,7 +967,8 @@ SUBROUTINE LeafEB(PPFD, Q, IRin, Eps, TranspireType,         &
 
       ! Heat convection coefficient (W m-2 K-1) for forced convection. 
       ! Nobel page 366
-      GHforced = 0.0259 / (0.004 * ((Llength / Ws)**0.5))
+      !GHforced = 0.0259 / (0.004 * ((Llength / Ws)**0.5))
+      GHforced = 0.0259 / (0.004 * sqrt(Lwidth / Ws1))
 
       ! Stomatal resistence s m-1
       StomRes  = ResSC(PPFD)

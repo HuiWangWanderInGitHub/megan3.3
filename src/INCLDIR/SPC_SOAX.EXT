@@ -1,0 +1,32 @@
+!=======================================================================
+!  SPC_SOAX.EXT
+!  This include file contains SOA (CAMx) species and their MW.
+!
+!
+!  Mechanism Name: SOA (CAMx)
+!  MEGAN v2.10
+!  INPUT version x.x
+!
+!  History:
+!  Who          When       What
+!  ---------------------------------------------------------------------
+!  bkoo         04/13/07 - Created
+!  bkoo         07/25/07 - Modified speciation
+!  Ling Huang   05/17/17 - Delete CG4, CB5, CB6 
+!=======================================================================
+
+      CHARACTER*16   SPC_SOAXMECH
+      PARAMETER     (SPC_SOAXMECH = 'SOAX            ')
+
+      INTEGER        N_SOAX_SPC
+      PARAMETER     (N_SOAX_SPC = 5)
+
+      CHARACTER*16   MECH_SPC_SOAX( N_SOAX_SPC )  ! Mechanism species name
+      REAL           MECH_MWT_SOAX( N_SOAX_SPC )  ! Mechanism species molecular weight
+
+
+      DATA  MECH_SPC_SOAX(  1), MECH_MWT_SOAX(  1) / 'ISP             ',  68.12  /
+      DATA  MECH_SPC_SOAX(  2), MECH_MWT_SOAX(  2) / 'TRP             ', 136.23  /
+      DATA  MECH_SPC_SOAX(  3), MECH_MWT_SOAX(  3) / 'XYLA            ', 106.17  /
+      DATA  MECH_SPC_SOAX(  4), MECH_MWT_SOAX(  4) / 'SQT             ', 204.35  /
+      DATA  MECH_SPC_SOAX(  5), MECH_MWT_SOAX(  5) / 'TOLA            ',  92.14  /
